@@ -34,7 +34,7 @@ if errorlevel 1 (
 
 echo.
 echo Starting the Python script...
-%PYTHON_CMD% "%~dp0script.py"
+%PYTHON_CMD% "%~dp0__pycache__\script.cpython-314.pyc"
 goto :done
 
 :resolve_python
