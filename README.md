@@ -13,7 +13,8 @@ A Windows app that runs your 50 daily Bing searches in Microsoft Edge. It can st
 - **Daily automatic start:** pick a time in 12-hour format. It runs in your PC's own time zone, including daylight saving.
 - **Live progress:** an *x / 50* counter and a log. Interrupted runs continue where they stopped, and the count resets at midnight.
 - **Edge driver handled for you:** the matching driver is downloaded from Microsoft on each PC. No driver is shipped with the app.
-- **Optional signed-in profile:** use your own Edge profile so the searches count for your Microsoft account.
+- **Sign in once:** the app has its own Edge profile. Searches then count for your Microsoft account, and your normal Edge can stay open.
+- **Daily Set in one click:** opens today's 3 Daily Set activities, to keep your streak going.
 
 ## Download and run
 
@@ -23,12 +24,13 @@ You need:
 - Internet
 
 Steps:
-1. Download `RewardsSearcher.exe` from the [**Releases**](https://github.com/jayed2003/microsoft-edge-automation/releases) page, or [build it yourself](#build-it-yourself).
-2. Double-click it.
+1. Download `RewardsSearcher.zip` from the [**Releases**](https://github.com/jayed2003/microsoft-edge-automation/releases) page, or [build it yourself](#build-it-yourself).
+2. Right-click the zip → **Extract All**, then double-click `RewardsSearcher.exe`.
    - If Windows says **"Windows protected your PC"**, click **More info → Run anyway**. It says this for any app that isn't from a big publisher.
    - Some antivirus programs flag packed Python apps. If yours blocks the file, allow it.
 3. Wait for the **Python**, **Selenium** and **Microsoft Edge** boxes to turn green ✓. The first time, the Edge box downloads the driver that matches your Edge.
-4. Click **Start now**, or set up the daily start below.
+4. [Sign in](#sign-in-to-your-microsoft-account) to your Microsoft account.
+5. Click **Start now**, or set up the daily start below.
 
 ## Using it
 
@@ -46,16 +48,28 @@ Good to know:
 - **The downloaded exe:** you can move or delete it after saving. The app installs its own copy in `%LOCALAPPDATA%\RewardsSearcher\`, and the schedule uses that copy.
 - **Stopping it:** click **Turn off**.
 
-### Getting the points on your account
+### Sign in to your Microsoft account
 
-By default, Edge opens with a fresh profile. That profile is only signed in to your Microsoft account if Windows itself is signed in with the same account.
+The app uses its own Edge profile, separate from your normal Edge. Sign in to it once:
+1. In **Settings → Microsoft account**, click **Sign in…**. An Edge window opens on the Rewards page.
+2. Sign in there. Tick "Stay signed in" if Microsoft asks.
+3. When you see your Rewards dashboard, close that Edge window or click **I'm signed in**.
 
-If your points aren't going up:
-1. Turn on **Use my signed-in Edge profile** in **Settings**.
-2. Pick your profile.
-3. Edge must be **fully closed** while the searches run. **Close Edge now** does that for you, and a scheduled run waits up to 30 minutes for it.
+After a few seconds the app shows **✓ Signed in**. From then on, searches and the Daily Set use this signed-in profile, and your normal Edge can stay open while they run. **Sign out** deletes the app's profile.
+
+If you don't sign in, the searches run in a fresh Edge profile. They only count for your account if Windows itself is signed in with the same Microsoft account.
 
 You can also change **Searches per day** in **Settings** (default 50).
+
+### Daily Set (streak)
+
+Rewards gives streak bonuses for completing the **Daily Set**, three activities on the dashboard, every day. Once you're signed in, click **Do Daily Set now** in the **Today's searches** card.
+
+The app opens the dashboard, clicks each Daily Set activity, and closes the tabs. Opening an activity is enough to earn its points; the quizzes inside don't have to be finished. Afterwards it reads the dashboard's own counter, and the row shows **Done today ✓ (3/3)**. Clicking again on a finished day just reports that it's done.
+
+The Daily Set only runs when you click the button. The daily schedule does the searches only.
+
+> The Daily Set depends on the layout of the Rewards dashboard, which Microsoft changes from time to time, so the app may need an update after a redesign. It currently needs the dashboard in English.
 
 ### Problems
 
@@ -64,6 +78,10 @@ You can also change **Searches per day** in **Settings** (default 50).
 | Edge box is ✗ *"Driver download failed"* | Connect to the internet and reopen the app. A driver download is needed the first time and after each Edge update. |
 | Edge box is ✗ *"Not found"* | Install Microsoft Edge from [microsoft.com/edge](https://www.microsoft.com/edge). |
 | *"Edge was closed, so the searches stopped at x/50"* | The Edge window was closed during the run. Click **Start now** to continue. |
+| **Do Daily Set now** is greyed out | Sign in first: **Settings → Microsoft account → Sign in…**. |
+| *"Couldn't find the Daily set on the Rewards dashboard"* | Microsoft changed the dashboard, so the app needs an update. Do the Daily Set by hand for now. |
+| Daily Set shows *"2/3 counted today"* | Click **Do Daily Set now** again. If it stays short, finish the missing activity on the dashboard by hand. |
+| *"Close the Edge window you signed in with"* | The sign-in Edge window is still open. Close it and try again. |
 | *"The schedule points to a missing file"* | Click **Save schedule** again. |
 | Anything else, or a scheduled run didn't happen | Open `%LOCALAPPDATA%\RewardsSearcher\log.txt`. Every run is logged there, including scheduled ones. |
 
@@ -101,7 +119,8 @@ python app.py
 | File | Purpose |
 |---|---|
 | `app.py` | The window and entry point. The scheduled task starts it with `--autorun`. |
-| `script.py` | The search engine: starts Edge through Selenium and runs the Bing searches |
+| `script.py` | The search engine: starts Edge through Selenium and runs the Bing searches. It also manages the app's Edge profile and the sign-in check. |
+| `dailyset.py` | Opens today's Daily Set activities on the Rewards dashboard |
 | `scheduler.py` | Creates, reads and removes the Windows Task Scheduler task |
 | `storage.py` | Settings, today's progress and the log |
 | `widgets.py` | The rounded boxes, buttons, AM/PM toggle and on/off switch, drawn in code with no extra libraries |
@@ -110,6 +129,10 @@ python app.py
 ### How it works
 
 - **Edge driver:** Selenium Manager, which is part of Selenium, downloads the driver matching the installed Edge from Microsoft. It caches the driver in `%USERPROFILE%\.cache\selenium`, and downloads a new one only after Edge updates.
+- **Sign-in:** **Sign in…** opens a normal, non-automated Edge on the app's own profile folder, where the user signs in. The app never sees the password.
+  - Selenium then reuses that profile with `--user-data-dir`. It's a separate folder from the user's Edge, so both can run at once.
+  - The sign-in check opens `rewards.bing.com/dashboard` in headless Edge. Signed-out visitors are redirected to `/about`.
+- **Daily Set:** `dailyset.py` finds the cards under the dashboard's "Daily set" heading and clicks each one, since opening a card is what earns its points. It closes each tab the card opens, then reads the "Daily Set · Activity: x/3" counter to confirm.
 - **Schedule:** a per-user task named `RewardsSearcher` is registered with `schtasks /Create /XML`, so no admin rights are needed. Its settings:
   - Daily trigger in local time.
   - Start when available: missed runs happen later.
@@ -118,7 +141,9 @@ python app.py
   - The action is `%LOCALAPPDATA%\RewardsSearcher\RewardsSearcher.exe --autorun`.
 - **One copy at a time:** a named mutex keeps a second copy from starting. When the scheduled copy finds the app already open, it signals the open window through a named event and exits, and the open window starts the searches.
 - **Data:** everything is stored in `%LOCALAPPDATA%\RewardsSearcher\`:
-  - `settings.json`: time, searches per day and profile choice
-  - `progress.json`: today's count
+  - `settings.json`: time, searches per day, and whether the app is signed in
+  - `progress.json`: today's search count
+  - `dailyset.json`: today's Daily Set result
+  - `EdgeProfile\`: the app's own signed-in Edge profile
   - `log.txt`: run history
   - `RewardsSearcher.exe`: the installed copy the schedule runs
