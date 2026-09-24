@@ -24,7 +24,7 @@ You need:
 - Internet
 
 Steps:
-1. Download `RewardsSearcher.zip` from the [**Releases**](https://github.com/jayed2003/microsoft-edge-automation/releases) page, or [build it yourself](#build-it-yourself).
+1. Download the zip from the [**latest release**](https://github.com/jayed2003/microsoft-edge-automation/releases/latest), or [build it yourself](#build-it-yourself).
 2. Right-click the zip → **Extract All**, then double-click `RewardsSearcher.exe`.
    - If Windows says **"Windows protected your PC"**, click **More info → Run anyway**. It says this for any app that isn't from a big publisher.
    - Some antivirus programs flag packed Python apps. If yours blocks the file, allow it.
