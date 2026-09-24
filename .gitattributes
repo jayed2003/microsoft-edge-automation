@@ -1,0 +1,4 @@
+* text=auto
+# cmd.exe needs Windows line endings for labels (goto/call) to work reliably.
+*.bat text eol=crlf
+*.png binary

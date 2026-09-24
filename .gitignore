@@ -1,2 +1,9 @@
+# Python
 __pycache__/
 *.pyc
+
+# Build environment and output (build_exe.bat)
+.venv/
+build/
+dist/
+*.spec

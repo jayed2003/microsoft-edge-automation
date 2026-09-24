@@ -1,96 +1,124 @@
-# Microsoft Rewards Search Launcher
+# Microsoft Edge Automation: Rewards Searcher
 
-This folder contains a Python script and a batch file that help run the browser automation.
+A Windows app that runs your 50 daily Bing searches in Microsoft Edge. It can start by itself every day at a time you choose.
 
-## Files
+![Rewards Searcher window](docs/screenshot.png)
 
-- `run_with_setup.bat` - Checks for Python and Selenium, installs them if possible, then runs the script
-- `script.py` - The Python automation script
+> **Heads-up:** automating searches is against the Microsoft Rewards terms. Microsoft can suspend accounts that do it. Use at your own risk.
 
-## Before You Start
+## Features
 
-The user should have:
+- **One file, nothing to install:** Python and Selenium are packed inside `RewardsSearcher.exe`.
+- **Status checks:** boxes show whether Python, Selenium and Microsoft Edge are ready.
+- **Daily automatic start:** pick a time in 12-hour format. It runs in your PC's own time zone, including daylight saving.
+- **Live progress:** an *x / 50* counter and a log. Interrupted runs continue where they stopped, and the count resets at midnight.
+- **Edge driver handled for you:** the matching driver is downloaded from Microsoft on each PC. No driver is shipped with the app.
+- **Optional signed-in profile:** use your own Edge profile so the searches count for your Microsoft account.
 
-- Windows
-- Microsoft Edge installed
-- An internet connection
+## Download and run
 
-## Only if you have problems with the script ##
+You need:
+- Windows 10 or 11
+- Microsoft Edge
+- Internet
 
-- Fallback Microsoft Edge driver "msedgedriver.exe" if you have problems with the script.
+Steps:
+1. Download `RewardsSearcher.exe` from the [**Releases**](https://github.com/jayed2003/microsoft-edge-automation/releases) page, or [build it yourself](#build-it-yourself).
+2. Double-click it.
+   - If Windows says **"Windows protected your PC"**, click **More info → Run anyway**. It says this for any app that isn't from a big publisher.
+   - Some antivirus programs flag packed Python apps. If yours blocks the file, allow it.
+3. Wait for the **Python**, **Selenium** and **Microsoft Edge** boxes to turn green ✓. The first time, the Edge box downloads the driver that matches your Edge.
+4. Click **Start now**, or set up the daily start below.
 
-The batch file can try to install Python automatically, but this only works if `winget` is available on the PC.
+## Using it
 
-## Easiest Way To Run
+### Start automatically every day
 
-1. Put the whole folder on the other PC.
-2. Double-click `run_with_setup.bat`.
-3. Wait while it checks for Python and Selenium.
-4. If needed, allow Windows prompts for installation.
-5. The script will start automatically after setup finishes.
+1. Under **Automatic daily start**, pick the hour, minutes and **AM | PM**.
+2. Click **Save schedule**. You only do this once.
 
-## What The Batch File Does
+Good to know:
+- **Time zone:** your PC's time zone is shown next to the time field. If it's wrong, fix it in **Settings → Time & Language → Date & time**.
+- **At the chosen time:** the app opens, Edge opens, and the searches run. The window closes 10 seconds after they finish.
+- **App already open:** the open window starts the searches itself.
+- **PC off or asleep:** the searches start as soon as you're back. The PC has to be on and you have to be signed in to Windows.
+- **On a laptop:** it also runs on battery.
+- **The downloaded exe:** you can move or delete it after saving. The app installs its own copy in `%LOCALAPPDATA%\RewardsSearcher\`, and the schedule uses that copy.
+- **Stopping it:** click **Turn off**.
 
-When `run_with_setup.bat` runs, it:
+### Getting the points on your account
 
-1. Checks whether Python is installed
-2. Tries to install Python automatically with `winget` if Python is missing
-3. Checks whether the `selenium` package is installed
-4. Installs `selenium` if it is missing
-5. Starts `script.py`
+By default, Edge opens with a fresh profile. That profile is only signed in to your Microsoft account if Windows itself is signed in with the same account.
 
-## If Python Does Not Install Automatically
+If your points aren't going up:
+1. Turn on **Use my signed-in Edge profile** in **Settings**.
+2. Pick your profile.
+3. Edge must be **fully closed** while the searches run. **Close Edge now** does that for you, and a scheduled run waits up to 30 minutes for it.
 
-If the batch file says Python could not be installed:
+You can also change **Searches per day** in **Settings** (default 50).
 
-1. Install Python manually from [python.org](https://www.python.org/downloads/)
-2. During setup, enable the option to add Python to `PATH` if it is shown
-3. Run `run_with_setup.bat` again
+### Problems
 
-## If Selenium Fails To Install
+| What you see | What to do |
+|---|---|
+| Edge box is ✗ *"Driver download failed"* | Connect to the internet and reopen the app. A driver download is needed the first time and after each Edge update. |
+| Edge box is ✗ *"Not found"* | Install Microsoft Edge from [microsoft.com/edge](https://www.microsoft.com/edge). |
+| *"Edge was closed, so the searches stopped at x/50"* | The Edge window was closed during the run. Click **Start now** to continue. |
+| *"The schedule points to a missing file"* | Click **Save schedule** again. |
+| Anything else, or a scheduled run didn't happen | Open `%LOCALAPPDATA%\RewardsSearcher\log.txt`. Every run is logged there, including scheduled ones. |
 
-Open Command Prompt in this folder and run:
+### Uninstall
 
-```bat
-python -m pip install selenium
-```
+1. Click **Turn off** in the app.
+2. Delete the folder `%LOCALAPPDATA%\RewardsSearcher`.
 
-If `python` does not work, try:
+## Build it yourself
 
-```bat
-py -3 -m pip install selenium
-```
-
-## Common Problems
-
-### Edge Driver Version Problem
-
-If Edge opens poorly or the script fails to start the browser, the local `msedgedriver.exe` may not match the installed version of Microsoft Edge on that PC.
-
-The script first tries Selenium Manager, which usually fixes this automatically. If that still does not work, update Microsoft Edge and try again.
-
-### `winget` Is Missing
-
-Some Windows installs do not have `winget`. In that case, Python must be installed manually.
-
-### Permission Prompts
-
-Windows may ask for permission before installing software. The user must allow those prompts for automatic setup to work.
-
-## Manual Run Option
-
-If needed, the script can also be started manually:
+You need Python 3.12 or newer on Windows.
 
 ```bat
-python script.py
+git clone https://github.com/jayed2003/microsoft-edge-automation.git
+cd microsoft-edge-automation
+build_exe.bat
 ```
 
-or:
+`build_exe.bat` does three things:
+1. Creates a local `.venv`.
+2. Installs Selenium and PyInstaller into it.
+3. Builds a single self-contained `dist\RewardsSearcher.exe`. That is the only file you need to share.
+
+To run from source instead:
 
 ```bat
-py -3 script.py
+pip install selenium
+python app.py
 ```
 
-## Share Tip
+`python script.py` runs the 50 searches without the window.
 
-When sharing this project, send the entire `edgedriver_win64` folder, not just one file.
+### Project files
+
+| File | Purpose |
+|---|---|
+| `app.py` | The window and entry point. The scheduled task starts it with `--autorun`. |
+| `script.py` | The search engine: starts Edge through Selenium and runs the Bing searches |
+| `scheduler.py` | Creates, reads and removes the Windows Task Scheduler task |
+| `storage.py` | Settings, today's progress and the log |
+| `widgets.py` | The rounded boxes, buttons, AM/PM toggle and on/off switch, drawn in code with no extra libraries |
+| `build_exe.bat` | Builds `dist\RewardsSearcher.exe` with PyInstaller |
+
+### How it works
+
+- **Edge driver:** Selenium Manager, which is part of Selenium, downloads the driver matching the installed Edge from Microsoft. It caches the driver in `%USERPROFILE%\.cache\selenium`, and downloads a new one only after Edge updates.
+- **Schedule:** a per-user task named `RewardsSearcher` is registered with `schtasks /Create /XML`, so no admin rights are needed. Its settings:
+  - Daily trigger in local time.
+  - Start when available: missed runs happen later.
+  - Runs on battery.
+  - Runs only while the user is logged on, because Edge must be visible.
+  - The action is `%LOCALAPPDATA%\RewardsSearcher\RewardsSearcher.exe --autorun`.
+- **One copy at a time:** a named mutex keeps a second copy from starting. When the scheduled copy finds the app already open, it signals the open window through a named event and exits, and the open window starts the searches.
+- **Data:** everything is stored in `%LOCALAPPDATA%\RewardsSearcher\`:
+  - `settings.json`: time, searches per day and profile choice
+  - `progress.json`: today's count
+  - `log.txt`: run history
+  - `RewardsSearcher.exe`: the installed copy the schedule runs
