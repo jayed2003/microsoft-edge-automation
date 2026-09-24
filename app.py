@@ -1,9 +1,9 @@
 import ctypes
 import datetime
-import json
 import os
 import platform
 import queue
+import shutil
 import sys
 import threading
 import tkinter as tk
@@ -15,15 +15,15 @@ import widgets
 
 try:
     import script
+    import dailyset
     SELENIUM_IMPORT_ERROR = None
 except ImportError as exc:  # only possible when running from source
-    script = None
+    script = dailyset = None
     SELENIUM_IMPORT_ERROR = str(exc)
 
 WINDOW_TITLE = "Rewards Searcher"
-EDGE_CLIENT_KEY = r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}"
-EDGE_WAIT_MINUTES = 30
 AUTO_CLOSE_SECONDS = 10
+SIGNIN_RETRY_MS = 30000
 
 C = {
     "bg": "#f3f5f9",
@@ -48,40 +48,6 @@ def plural(n):
 
 # --- Environment checks ---------------------------------------------------
 
-def edge_version():
-    import winreg
-    for hive, key in (
-        (winreg.HKEY_LOCAL_MACHINE, EDGE_CLIENT_KEY.replace("SOFTWARE\\", "SOFTWARE\\WOW6432Node\\", 1)),
-        (winreg.HKEY_LOCAL_MACHINE, EDGE_CLIENT_KEY),
-        (winreg.HKEY_CURRENT_USER, EDGE_CLIENT_KEY),
-    ):
-        try:
-            with winreg.OpenKey(hive, key) as k:
-                return winreg.QueryValueEx(k, "pv")[0]
-        except OSError:
-            continue
-    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")):
-        if base and os.path.exists(os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe")):
-            return "installed"
-    return None
-
-
-def list_edge_profiles():
-    """[(folder, display name)] from Edge's Local State, Default first."""
-    profiles = []
-    try:
-        with open(os.path.join(script.EDGE_USER_DATA_DIR, "Local State"), encoding="utf-8") as f:
-            cache = json.load(f)["profile"]["info_cache"]
-        for folder, info in cache.items():
-            profiles.append((folder, info.get("name") or folder))
-    except (OSError, ValueError, KeyError, AttributeError, TypeError):
-        pass
-    if not profiles:
-        profiles = [("Default", "Default")]
-    profiles.sort(key=lambda p: (p[0] != "Default", p[0]))
-    return profiles
-
-
 def check_environment(put):
     frozen = scheduler.is_frozen()
     put(("status", "python", "ok", platform.python_version(),
@@ -95,7 +61,7 @@ def check_environment(put):
     put(("status", "selenium", "ok", selenium.__version__,
          "Bundled inside the app" if frozen else "Installed"))
 
-    version = edge_version()
+    version = script.edge_version()
     if not version:
         put(("status", "edge", "error", "Not found", "Install Microsoft Edge from microsoft.com/edge"))
         return
@@ -154,17 +120,18 @@ class App:
         self.q = queue.Queue()
         self.settings = storage.load_settings()
         self.worker = None
+        self.task = None  # "searches" or "dailyset" while the worker runs
         self.stop_event = threading.Event()
         self.auto_mode = False
         self.closing = False
-        self.start_after_close = False
-        self.edge_wait_deadline = None
         self.close_countdown = None
         self.schedule_info = None
         self.schedule_error = None
         self.schedule_busy = True
         self.shown_date = None
-        self.edge_profiles = list_edge_profiles() if script else [("Default", "Default")]
+        # signed_out | signing_in | checking | signed_in
+        self.account_state = "signed_in" if self.settings.get("signed_in") else "signed_out"
+        self.signin_watch = None
 
         self._style()
         self._build()
@@ -184,8 +151,8 @@ class App:
     def _style(self):
         self.root.title(WINDOW_TITLE)
         self.root.configure(bg=C["bg"])
-        self.root.geometry("820x860")
-        self.root.minsize(720, 760)
+        self.root.geometry("820x900")
+        self.root.minsize(720, 820)
         s = ttk.Style(self.root)
         s.theme_use("clam")
         s.configure(".", font=(FONT, 10), background=C["card"], foreground=C["text"])
@@ -313,9 +280,17 @@ class App:
         self.run_label.pack(side="left", fill="x", expand=True)
         self.keep_btn = ttk.Button(status_line, text="Keep open", command=self.cancel_auto_close)
 
+        ds_row = tk.Frame(body, bg=C["card"])
+        ds_row.pack(fill="x", pady=(10, 0))
+        self._label(ds_row, "Daily Set", 10, bold=True).pack(side="left")
+        self.ds_label = self._label(ds_row, "", 10, "muted", anchor="w")
+        self.ds_label.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        self.ds_btn = ttk.Button(ds_row, text="Do Daily Set now", command=self.start_daily_set)
+        self.ds_btn.pack(side="right")
+
         log_frame = tk.Frame(body, bg=C["card"])
         log_frame.pack(fill="both", expand=True, pady=(10, 0))
-        self.log_text = tk.Text(log_frame, height=7, bg="#f7f8fb", fg=C["text"], relief="flat",
+        self.log_text = tk.Text(log_frame, height=5, bg="#f7f8fb", fg=C["text"], relief="flat",
                                 font=("Consolas", 9), wrap="word", state="disabled",
                                 highlightthickness=1, highlightbackground=C["border"],
                                 padx=8, pady=6)
@@ -341,26 +316,18 @@ class App:
 
         row = tk.Frame(body, bg=C["card"])
         row.pack(fill="x", pady=(10, 0))
-        self.profile_var = tk.BooleanVar(value=bool(self.settings.get("use_profile")))
-        widgets.ToggleSwitch(row, "Use my signed-in Edge profile", self.profile_var, C,
-                             command=self.on_profile_change, font_family=FONT).pack(side="left")
-        names = [f"{name} ({folder})" if name != folder else folder
-                 for folder, name in self.edge_profiles]
-        self.profile_combo = ttk.Combobox(row, values=names, state="readonly", width=26,
-                                          style="Round.TCombobox")
-        current = self.settings.get("profile_dir", "Default")
-        folders = [p[0] for p in self.edge_profiles]
-        self.profile_combo.current(folders.index(current) if current in folders else 0)
-        self.profile_combo.bind("<<ComboboxSelected>>", lambda e: self.on_profile_change())
-        self.profile_combo.pack(side="left", padx=(14, 0))
-        self.close_edge_btn = ttk.Button(row, text="Close Edge now", command=self.close_edge_clicked)
-        self.close_edge_btn.pack(side="right")
-        self.profile_note = self._label(
-            body, "Searches then count for the Microsoft account signed in to that Edge profile. "
-                  "Edge must be fully closed while the searches run.",
-            9, "muted", anchor="w", justify="left", wraplength=720)
-        self.profile_note.pack(fill="x", pady=(4, 0))
-        self._update_profile_widgets()
+        self._label(row, "Microsoft account").pack(side="left")
+        self.account_label = self._label(row, "", 10, "muted")
+        self.account_label.pack(side="left", padx=(10, 0))
+        self.signin_btn = ttk.Button(row, text="Sign in…", style="Accent.TButton",
+                                     command=self.sign_in)
+        self.signin_done_btn = ttk.Button(row, text="I'm signed in", style="Accent.TButton",
+                                          command=self.finish_sign_in)
+        self.signout_btn = ttk.Button(row, text="Sign out", command=self.sign_out)
+        self.account_note = self._label(body, "", 9, "muted", anchor="w", justify="left",
+                                        wraplength=720)
+        self.account_note.pack(fill="x", pady=(4, 0))
+        self._render_account()
 
     # ----- helpers -----
     def append_log(self, msg):
@@ -397,7 +364,7 @@ class App:
         p = storage.load_progress(target)
         self.shown_date = p["date"]
         self.set_progress(p["done"], target)
-        if not self.running() and self.edge_wait_deadline is None:
+        if not self.running():
             if p["done"] >= target:
                 self.set_run_status("Completed for today ✓", "ok")
             elif p["done"]:
@@ -407,7 +374,10 @@ class App:
         return p
 
     def _set_buttons(self, running):
-        self.start_btn.configure(state="disabled" if running or script is None else "normal")
+        blocked = running or script is None or self.account_busy()
+        self.start_btn.configure(state="disabled" if blocked else "normal")
+        self.ds_btn.configure(state="disabled" if blocked or self.account_state != "signed_in"
+                              else "normal")
         self.stop_btn.configure(state="normal" if running else "disabled")
         self.target_spin.configure(state="disabled" if running else "normal")
 
@@ -421,29 +391,114 @@ class App:
         if not self.running():
             self.refresh_progress()
 
-    def selected_profile_dir(self):
-        idx = self.profile_combo.current()
-        return self.edge_profiles[idx][0] if 0 <= idx < len(self.edge_profiles) else "Default"
+    # ----- Microsoft account (the app's own Edge profile) -----
+    def account_busy(self):
+        return self.account_state in ("signing_in", "checking")
 
-    def on_profile_change(self):
-        self.settings["use_profile"] = bool(self.profile_var.get())
-        self.settings["profile_dir"] = self.selected_profile_dir()
+    def _render_account(self):
+        text, color, note, buttons = {
+            "signed_out": (
+                "Not signed in", "warn",
+                "Sign in once so the searches count for your account and the Daily Set can run. "
+                "The app uses its own Edge window, so your normal Edge can stay open.",
+                [self.signin_btn]),
+            "signing_in": (
+                "Waiting for you to sign in…", "accent",
+                "Sign in on the Rewards page in the Edge window that opened, then close that "
+                "window (or click I'm signed in).",
+                [self.signin_done_btn]),
+            "checking": ("Checking…", "muted", "Checking the sign-in, this takes a few seconds.", []),
+            "signed_in": (
+                "✓ Signed in", "ok",
+                "Searches and the Daily Set use the app's signed-in Edge profile. "
+                "Your normal Edge can stay open.",
+                [self.signout_btn]),
+        }[self.account_state]
+        self.account_label.configure(text=text, fg=C[color])
+        self.account_note.configure(text=note)
+        for button in (self.signin_btn, self.signin_done_btn, self.signout_btn):
+            if button in buttons:
+                button.pack(side="right")
+                button.configure(state="normal" if script else "disabled")
+            else:
+                button.pack_forget()
+        if not self.running():
+            self._set_buttons(False)
+            self.refresh_daily_set()
+
+    def _set_account_state(self, state):
+        self.account_state = state
+        self._render_account()
+
+    def sign_in(self):
+        if self.running() or self.account_busy():
+            return
+        self._set_account_state("checking")
+        self.append_log("Opening Edge so you can sign in…")
+
+        def work():
+            try:
+                script.close_app_profile_edge()
+                script.open_signin_window()
+                self.q.put(("signin_opened",))
+            except Exception as exc:
+                self.q.put(("account", False, f"Could not open Edge: {exc}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _watch_sign_in_window(self):
+        """Waits (in a thread) until the sign-in Edge window is closed."""
+        def work(token):
+            seen = False
+            for _ in range(1800):  # up to an hour
+                if self.signin_watch != token:
+                    return
+                if script.app_profile_edge_pids():
+                    seen = True
+                elif seen:
+                    self.q.put(("signin_closed", token))
+                    return
+                threading.Event().wait(2)
+        token = object()
+        self.signin_watch = token
+        threading.Thread(target=work, args=(token,), daemon=True).start()
+
+    def finish_sign_in(self):
+        self.signin_watch = None
+        self._set_account_state("checking")
+
+        def work():
+            try:
+                script.close_app_profile_edge()  # closes the sign-in window cleanly
+                ok = script.check_signed_in(log=storage.log)
+                self.q.put(("account", ok, None if ok else
+                            "Not signed in yet. Click Sign in… and sign in on the Rewards page."))
+            except Exception as exc:
+                self.q.put(("account", False, f"Could not check the sign-in: {exc}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def sign_out(self):
+        if self.running() or self.account_busy():
+            return
+        if not messagebox.askyesno(WINDOW_TITLE, "Sign out? The app's Edge profile, including "
+                                                 "its sign-in, will be deleted."):
+            return
+        self._set_account_state("checking")
+
+        def work():
+            script.close_app_profile_edge()
+            shutil.rmtree(storage.EDGE_PROFILE_DIR, ignore_errors=True)
+            self.q.put(("account", False, "Signed out."))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_account(self, signed_in, message):
+        self.settings["signed_in"] = signed_in
         storage.save_settings(self.settings)
-        self._update_profile_widgets()
+        storage.log(f"Account check: {'signed in' if signed_in else 'not signed in'}")
+        self.append_log("Signed in to Microsoft Rewards." if signed_in else (message or "Not signed in."))
+        self._set_account_state("signed_in" if signed_in else "signed_out")
 
-    def _update_profile_widgets(self):
-        on = bool(self.profile_var.get())
-        self.profile_combo.configure(state="readonly" if on else "disabled")
-        if on:
-            self.close_edge_btn.pack(side="right")
-        else:
-            self.close_edge_btn.pack_forget()
-
-    def close_edge_clicked(self):
-        self.close_edge_btn.configure(state="disabled")
-        self.append_log("Closing Microsoft Edge…")
-        threading.Thread(target=lambda: self.q.put(("edge_closed", script.close_edge())),
-                         daemon=True).start()
+    def profile_dir(self):
+        return storage.EDGE_PROFILE_DIR if self.account_state == "signed_in" else None
 
     # ----- schedule -----
     def _refresh_schedule_async(self, error=None):
@@ -568,7 +623,12 @@ class App:
 
     # ----- running -----
     def start_run(self, auto=False):
-        if self.running() or script is None:
+        if script is None:
+            return
+        if self.running():
+            if auto and self.task == "dailyset":
+                # The scheduled searches start once the Daily Set has finished.
+                self.root.after(SIGNIN_RETRY_MS, lambda: self.start_run(auto=True))
             return
         self.cancel_auto_close()
         self.auto_mode = auto
@@ -581,33 +641,27 @@ class App:
                 self.begin_auto_close()
             return
 
-        use_profile = bool(self.profile_var.get())
-        if use_profile and script.is_edge_running():
-            if auto:
-                self.wait_for_edge()
-            elif messagebox.askyesno(
-                    WINDOW_TITLE,
-                    "Microsoft Edge is open, so your profile can't be used.\n\n"
-                    "Close all Edge windows now? Your tabs can be restored the next time you open Edge."):
-                self.start_after_close = True
-                self.close_edge_clicked()
+        if self.account_busy():
+            # A scheduled start while the sign-in window is open: try again shortly.
+            self.set_run_status("Waiting for the sign-in to finish…", "warn")
+            self.root.after(SIGNIN_RETRY_MS, lambda: self.start_run(auto=auto))
             return
 
-        self.edge_wait_deadline = None
+        profile_dir = self.profile_dir()
+        self.task = "searches"
         self.stop_event = threading.Event()
         self.set_progress(progress["done"], target)
         self.set_run_status(f"Running… {plural(target - progress['done'])} to go", "accent")
         self.append_log(f"Starting ({progress['done']}/{target} done today)")
         storage.log(f"Run started at {progress['done']}/{target} "
-                    f"({'scheduled' if auto else 'manual'}, profile={'on' if use_profile else 'off'})")
+                    f"({'scheduled' if auto else 'manual'}, "
+                    f"{'signed-in profile' if profile_dir else 'fresh profile'})")
         self._set_buttons(True)
         self.worker = threading.Thread(
-            target=self._worker,
-            args=(target, progress["done"], use_profile, self.selected_profile_dir()),
-            daemon=True)
+            target=self._worker, args=(target, progress["done"], profile_dir), daemon=True)
         self.worker.start()
 
-    def _worker(self, target, done, use_profile, profile_dir):
+    def _worker(self, target, done, profile_dir):
         def on_event(kind, *args):
             if kind == "progress":
                 storage.save_progress(args[0], args[1])
@@ -615,11 +669,8 @@ class App:
                 storage.log(args[0])
             self.q.put((kind, *args))
         try:
-            final = script.run_searches(target, done, self.stop_event, on_event,
-                                        use_profile, profile_dir)
+            final = script.run_searches(target, done, self.stop_event, on_event, profile_dir)
             self.q.put(("done", final, target))
-        except script.EdgeRunningError as exc:
-            self.q.put(("edge_running", str(exc)))
         except script.BrowserClosedError as exc:
             storage.log(str(exc))
             self.q.put(("browser_closed", str(exc)))
@@ -630,39 +681,66 @@ class App:
             self.q.put(("worker_end",))
 
     def stop_run(self):
-        if self.edge_wait_deadline is not None:
-            self.edge_wait_deadline = None
-            self.set_run_status("Stopped waiting for Edge.")
-            self._set_buttons(False)
-            return
         if self.running():
             self.stop_event.set()
             self.stop_btn.configure(state="disabled")
-            self.set_run_status("Stopping after the current search…")
+            if self.task == "dailyset":
+                self.ds_label.configure(text="Stopping…", fg=C["muted"])
+            else:
+                self.set_run_status("Stopping after the current search…")
 
-    def wait_for_edge(self):
-        if self.edge_wait_deadline is None:
-            self.edge_wait_deadline = datetime.datetime.now() + datetime.timedelta(minutes=EDGE_WAIT_MINUTES)
-            self.append_log("Edge is open. Waiting for it to close so your profile can be used.")
-        self.set_run_status("Waiting for Microsoft Edge to close… (or click Close Edge now)", "warn")
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self.root.after(5000, self._check_edge_wait)
-
-    def _check_edge_wait(self):
-        if self.edge_wait_deadline is None:
+    # ----- Daily Set -----
+    def refresh_daily_set(self):
+        if self.running() and self.task == "dailyset":
             return
-        if self.running():
-            self.root.after(1000, self._check_edge_wait)
-        elif not script.is_edge_running():
-            self.start_run(auto=True)
-        elif datetime.datetime.now() > self.edge_wait_deadline:
-            self.edge_wait_deadline = None
-            self._set_buttons(False)
-            self.set_run_status("Gave up waiting for Edge to close. Close Edge and click Start now.", "error")
-            storage.log("Gave up waiting for Edge to close.")
+        d = storage.load_daily_set()
+        if self.account_state != "signed_in":
+            text, color = "Sign in (Settings → Microsoft account) to use the Daily Set.", "muted"
+        elif d["total"] and d["done"] >= d["total"]:
+            text, color = f"Done today ✓ ({d['done']}/{d['total']})", "ok"
+        elif d["total"]:
+            text, color = f"{d['done']}/{d['total']} counted today. Click the button to try again.", "warn"
         else:
-            self.root.after(5000, self._check_edge_wait)
+            text, color = "Not done today", "muted"
+        self.ds_label.configure(text=text, fg=C[color])
+
+    def start_daily_set(self):
+        if self.running() or self.account_busy() or dailyset is None:
+            return
+        if self.account_state != "signed_in":
+            messagebox.showinfo(WINDOW_TITLE, "Sign in first: Settings → Microsoft account → Sign in…")
+            return
+        self.cancel_auto_close()
+        self.auto_mode = False
+        self.task = "dailyset"
+        self.stop_event = threading.Event()
+        self.ds_label.configure(text="Starting…", fg=C["accent"])
+        self.append_log("Starting the Daily Set")
+        storage.log("Daily Set started")
+        self._set_buttons(True)
+        self.worker = threading.Thread(target=self._dailyset_worker, daemon=True)
+        self.worker.start()
+
+    def _dailyset_worker(self):
+        def on_event(kind, *args):
+            if kind == "log":
+                storage.log(args[0])
+            self.q.put((kind, *args))
+        try:
+            done, total, failed = dailyset.run_daily_set(self.stop_event, on_event)
+            storage.save_daily_set(done, total, failed)
+            self.q.put(("dailyset_done", done, total, failed))
+        except dailyset.NotSignedInError as exc:
+            storage.log(str(exc))
+            self.q.put(("account", False, str(exc)))
+        except script.BrowserClosedError as exc:
+            storage.log(str(exc))
+            self.q.put(("dailyset_error", str(exc), False))
+        except Exception as exc:
+            storage.log(f"Daily Set error: {exc}")
+            self.q.put(("dailyset_error", str(exc), True))
+        finally:
+            self.q.put(("worker_end",))
 
     def begin_auto_close(self):
         self.close_countdown = AUTO_CLOSE_SECONDS
@@ -733,34 +811,39 @@ class App:
         elif kind == "browser_closed":
             self.set_run_status(ev[1], "warn")
             self.append_log(ev[1])
-        elif kind == "edge_running":
-            if self.auto_mode:
-                self.wait_for_edge()
-            else:
-                self.set_run_status(ev[1], "warn")
-        elif kind == "edge_closed":
-            self.close_edge_btn.configure(state="normal")
-            ok = ev[1]
-            self.append_log("Edge closed." if ok else "Edge is still running.")
-            if self.start_after_close:
-                self.start_after_close = False
-                if ok:
-                    self.start_run(auto=False)
-                else:
-                    messagebox.showwarning(WINDOW_TITLE, "Edge could not be closed. Close it manually and try again.")
-            elif ok and self.edge_wait_deadline is not None:
-                self.start_run(auto=True)
+        elif kind == "dailyset":
+            _, step, total, title = ev
+            self.ds_label.configure(text=f"Running… {step}/{total}: {title}", fg=C["accent"])
+        elif kind == "dailyset_done":
+            _, done, total, failed = ev
+            self.worker = None  # so refresh_daily_set shows the saved result
+            self.refresh_daily_set()
+            if failed:
+                self.append_log("Couldn't open: " + ", ".join(failed))
+        elif kind == "dailyset_error":
+            _, message, popup = ev
+            self.ds_label.configure(text=f"✗ {message.splitlines()[0]}", fg=C["error"])
+            self.append_log(message)
+            if popup and not self.closing:
+                messagebox.showerror(WINDOW_TITLE, message)
+        elif kind == "signin_opened":
+            self._set_account_state("signing_in")
+            self._watch_sign_in_window()
+        elif kind == "signin_closed":
+            if self.signin_watch is ev[1]:
+                self.finish_sign_in()
+        elif kind == "account":
+            self._on_account(ev[1], ev[2])
         elif kind == "worker_end":
             self.worker = None
-            if self.edge_wait_deadline is None:
-                self._set_buttons(False)
+            self._set_buttons(False)
             if self.closing:
                 self.root.destroy()
 
     def _tick(self):
         """Every 30 s: roll over to a new day at midnight."""
         if (self.shown_date != storage.today() and not self.running()
-                and self.edge_wait_deadline is None and self.close_countdown is None):
+                and self.close_countdown is None):
             self.refresh_progress()
         self.root.after(30000, self._tick)
 
@@ -774,12 +857,13 @@ class App:
             self.root.lift()
         except tk.TclError:
             pass
-        if not self.running() and self.edge_wait_deadline is None:
+        if not self.running():
             self.start_run(auto=True)
 
     def on_close(self):
         if self.running():
-            if not messagebox.askyesno(WINDOW_TITLE, "Searches are running. Stop them and close?"):
+            what = "The Daily Set is" if self.task == "dailyset" else "Searches are"
+            if not messagebox.askyesno(WINDOW_TITLE, f"{what} running. Stop and close?"):
                 return
             self.closing = True
             self.stop_event.set()

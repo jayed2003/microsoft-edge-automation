@@ -12,20 +12,22 @@ from selenium.webdriver.edge.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+from storage import EDGE_PROFILE_DIR
+
 # --- Configuration ---
 NUMBER_OF_SEARCHES = 50
 MIN_WAIT = 3
 MAX_WAIT = 6
 MAX_CONSECUTIVE_FAILURES = 5
 BING_URL = "https://www.bing.com"
-EDGE_USER_DATA_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge", "User Data"
-)
+REWARDS_URL = "https://rewards.bing.com/"
+EDGE_CLIENT_KEY = r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}"
+EDGE_APP_PATH_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-class EdgeRunningError(RuntimeError):
-    """Edge is open, so its profile is locked and cannot be used by Selenium."""
+class ProfileInUseError(RuntimeError):
+    """The app's Edge profile is still open in another Edge window (e.g. sign-in)."""
 
 
 class BrowserClosedError(RuntimeError):
@@ -40,41 +42,153 @@ def _browser_gone(exc):
                                   "no such window", "target window already closed"))
 
 
-def is_edge_running():
+# --- Microsoft Edge on this PC -------------------------------------------------
+
+def _registry_value(hive, key, name):
+    import winreg
     try:
-        out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq msedge.exe", "/NH", "/FO", "CSV"],
-            capture_output=True, text=True, creationflags=NO_WINDOW,
-        ).stdout
+        with winreg.OpenKey(hive, key) as k:
+            return winreg.QueryValueEx(k, name)[0]
     except OSError:
-        return False
-    return '"msedge.exe"' in out.lower()
+        return None
 
 
-def close_edge():
-    """Ask Edge to close, then force-close leftovers (e.g. Startup boost)."""
-    subprocess.run(["taskkill", "/IM", "msedge.exe"],
-                   capture_output=True, creationflags=NO_WINDOW)
-    for _ in range(6):
+def edge_version():
+    import winreg
+    for hive, key in (
+        (winreg.HKEY_LOCAL_MACHINE, EDGE_CLIENT_KEY.replace("SOFTWARE\\", "SOFTWARE\\WOW6432Node\\", 1)),
+        (winreg.HKEY_LOCAL_MACHINE, EDGE_CLIENT_KEY),
+        (winreg.HKEY_CURRENT_USER, EDGE_CLIENT_KEY),
+    ):
+        version = _registry_value(hive, key, "pv")
+        if version:
+            return version
+    return "installed" if edge_exe_path() else None
+
+
+def edge_exe_path():
+    import winreg
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        path = _registry_value(hive, EDGE_APP_PATH_KEY, "")
+        if path and os.path.exists(path.strip('"')):
+            return path.strip('"')
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")):
+        path = os.path.join(base or "", "Microsoft", "Edge", "Application", "msedge.exe")
+        if base and os.path.exists(path):
+            return path
+    return None
+
+
+# --- The app's own Edge profile ----------------------------------------------------
+# The app signs in once in its own profile folder, so searches and the Daily Set
+# count for the user's account while their normal Edge stays open.
+
+def app_profile_edge_pids():
+    """PIDs of Edge processes using the app's profile folder."""
+    needle = EDGE_PROFILE_DIR.lower().replace("'", "''")
+    command = ("Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | Where-Object "
+               f"{{ $_.CommandLine -and $_.CommandLine.ToLower().Contains('{needle}') }} | "
+               "ForEach-Object { $_.ProcessId }")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                             capture_output=True, text=True, creationflags=NO_WINDOW).stdout
+    except OSError:
+        return []
+    return [int(pid) for pid in out.split() if pid.isdigit()]
+
+
+def close_app_profile_edge():
+    """Closes Edge windows that use the app's profile (never the user's own Edge).
+    Asks them to close first, so cookies such as the sign-in are saved."""
+    pids = app_profile_edge_pids()
+    if not pids:
+        return True
+    for pid in pids:
+        subprocess.run(["taskkill", "/PID", str(pid)], capture_output=True, creationflags=NO_WINDOW)
+    for _ in range(10):
         time.sleep(0.5)
-        if not is_edge_running():
+        pids = app_profile_edge_pids()
+        if not pids:
             return True
-    subprocess.run(["taskkill", "/IM", "msedge.exe", "/F", "/T"],
-                   capture_output=True, creationflags=NO_WINDOW)
+    for pid in pids:
+        subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
+                       capture_output=True, creationflags=NO_WINDOW)
     time.sleep(1)
-    return not is_edge_running()
+    return not app_profile_edge_pids()
 
 
-def build_edge_options(use_profile=False, profile_dir="Default"):
+def open_signin_window():
+    """Opens a normal (not automated) Edge window on the app's profile at the
+    Rewards page, where the user signs in themselves. Returns the process."""
+    exe = edge_exe_path()
+    if not exe:
+        raise RuntimeError("Microsoft Edge was not found. Install it from microsoft.com/edge.")
+    os.makedirs(EDGE_PROFILE_DIR, exist_ok=True)
+    return subprocess.Popen([exe, f"--user-data-dir={EDGE_PROFILE_DIR}", "--no-first-run",
+                             "--no-default-browser-check", "--new-window", REWARDS_URL])
+
+
+class BingUnavailableError(RuntimeError):
+    """Bing showed its "It's not you, it's us" error page."""
+
+
+def is_bing_error_page(driver):
+    return bool(driver.find_elements(By.CSS_SELECTOR, "#sw_content .panda, .panda img"))
+
+
+def is_signed_in_page(driver):
+    """On rewards.bing.com: signed-out visitors are sent to /about with Sign in links;
+    signed-in ones stay on the dashboard, which has the site's navigation tabs."""
+    url = driver.current_url.lower()
+    if "/about" in url or "login.live.com" in url or is_bing_error_page(driver):
+        return False
+    sign_in = driver.find_elements(By.CSS_SELECTOR, "a[href^='/auth/login']")
+    if any(link.is_displayed() for link in sign_in):
+        return False
+    return bool(driver.find_elements(By.CSS_SELECTOR, "a[href='/dashboard'], a[href='/earn']"))
+
+
+def check_signed_in(log=print):
+    """True if the app's Edge profile is signed in to Microsoft Rewards."""
+    if not os.path.isdir(EDGE_PROFILE_DIR):
+        return False
+    driver = start_edge(EDGE_PROFILE_DIR, headless=True, log=log)
+    try:
+        for attempt in range(3):
+            driver.get(REWARDS_URL + "dashboard")
+            time.sleep(5)  # let the page finish redirecting
+            if not is_bing_error_page(driver):
+                return is_signed_in_page(driver)
+            time.sleep(10)
+        raise BingUnavailableError("Bing isn't available right now. Try again in a few minutes.")
+    finally:
+        try:
+            driver.quit()
+        except WebDriverException:
+            pass
+
+
+def build_edge_options(profile_dir=None, headless=False):
     edge_options = Options()
     edge_options.add_argument("--start-maximized")
     edge_options.add_argument("--no-first-run")
     edge_options.add_argument("--no-default-browser-check")
     # edge_options.add_argument("--inprivate") # Optional: Use Incognito mode
-    if use_profile:
-        edge_options.add_argument(f"--user-data-dir={EDGE_USER_DATA_DIR}")
-        edge_options.add_argument(f"--profile-directory={profile_dir or 'Default'}")
+    if profile_dir:
+        edge_options.add_argument(f"--user-data-dir={profile_dir}")
+    if headless:
+        edge_options.add_argument("--headless=new")
+        edge_options.add_argument("--window-size=1280,900")
     return edge_options
+
+
+def start_edge(profile_dir=None, headless=False, log=print):
+    """Starts Selenium-controlled Edge, on the app's profile when profile_dir is given."""
+    if profile_dir and app_profile_edge_pids():
+        log("Closing a leftover Edge window that uses the app's profile...")
+        if not close_app_profile_edge():
+            raise ProfileInUseError("Close the Edge window you signed in with, then try again.")
+    return create_edge_driver(build_edge_options(profile_dir, headless), log)
 
 
 def create_edge_driver(edge_options, log=print):
@@ -84,6 +198,8 @@ def create_edge_driver(edge_options, log=print):
         log("Starting Edge with Selenium Manager...")
         return webdriver.Edge(options=edge_options)
     except WebDriverException as exc:
+        if "already in use" in (exc.msg or str(exc)).lower():
+            raise ProfileInUseError("Close the Edge window you signed in with, then try again.")
         raise RuntimeError("\n".join([
             "Unable to start Microsoft Edge.",
             "Make sure Microsoft Edge is installed and up to date.",
@@ -131,12 +247,13 @@ def _close_old_tab(driver, old_tab):
 
 
 def run_searches(target=NUMBER_OF_SEARCHES, already_done=0, stop_event=None,
-                 on_event=None, use_profile=False, profile_dir="Default"):
+                 on_event=None, profile_dir=None):
     """Run searches until `target` is reached, starting from `already_done`.
 
     on_event(kind, *args) receives ("log", msg), ("progress", done, target, query)
     and ("stopped", done, target). Returns the number of searches done.
-    Raises EdgeRunningError / RuntimeError when Edge cannot be started, and
+    profile_dir: the app's signed-in Edge profile, or None for a fresh profile.
+    Raises ProfileInUseError / RuntimeError when Edge cannot be started, and
     BrowserClosedError when the Edge window is closed mid-run.
     """
     emit = on_event or _print_event
@@ -156,12 +273,7 @@ def run_searches(target=NUMBER_OF_SEARCHES, already_done=0, stop_event=None,
         log(f"Already done today ({done}/{target}).")
         return done
 
-    if use_profile and is_edge_running():
-        raise EdgeRunningError(
-            "Microsoft Edge is open. Close it (including background Edge) to use your profile."
-        )
-
-    driver = create_edge_driver(build_edge_options(use_profile, profile_dir), log=log)
+    driver = start_edge(profile_dir, log=log)
     failures = 0
 
     try:
