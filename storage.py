@@ -8,6 +8,9 @@ DATA_DIR = os.path.join(
 )
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 PROGRESS_FILE = os.path.join(DATA_DIR, "progress.json")
+DAILY_SET_FILE = os.path.join(DATA_DIR, "dailyset.json")
+# The app's own Edge profile, signed in once by the user.
+EDGE_PROFILE_DIR = os.path.join(DATA_DIR, "EdgeProfile")
 LOG_FILE = os.path.join(DATA_DIR, "log.txt")
 MAX_LOG_BYTES = 512 * 1024
 
@@ -15,8 +18,7 @@ DEFAULT_SETTINGS = {
     "schedule_enabled": False,
     "time": "09:00",
     "searches_per_day": 50,
-    "use_profile": False,
-    "profile_dir": "Default",
+    "signed_in": False,
 }
 
 
@@ -44,6 +46,8 @@ def _write_json(path, data):
 def load_settings():
     settings = dict(DEFAULT_SETTINGS)
     settings.update(_read_json(SETTINGS_FILE))
+    for obsolete in ("use_profile", "profile_dir"):  # replaced by the app's own profile
+        settings.pop(obsolete, None)
     return settings
 
 
@@ -76,6 +80,19 @@ def save_progress(done, target):
         "target": target,
         "last_run": datetime.datetime.now().isoformat(timespec="seconds"),
     })
+
+
+def load_daily_set():
+    """Today's Daily Set result: {"date", "done", "total", "failed": [titles]}."""
+    data = _read_json(DAILY_SET_FILE)
+    if data.get("date") != today():
+        return {"date": today(), "done": 0, "total": 0, "failed": []}
+    return data
+
+
+def save_daily_set(done, total, failed=()):
+    _write_json(DAILY_SET_FILE, {"date": today(), "done": done, "total": total,
+                                 "failed": list(failed)})
 
 
 def log(message):
